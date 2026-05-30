@@ -111,3 +111,7 @@ clean_ckp.py
 *.pth
 
 .DS_Store
+uv.lock
+run
+*.txt
+wandb

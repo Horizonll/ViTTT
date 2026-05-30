@@ -3,7 +3,7 @@ import time
 import argparse
 import datetime
 import numpy as np
-
+import wandb
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
@@ -71,6 +71,12 @@ def main():
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
 
+    if dist.get_rank() == 0:
+        wandb.init(
+            project="ViTTT",
+            name=config.MODEL.NAME + f"-{args.tag}",
+            config=config,
+        )
     seed = config.SEED + dist.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -81,7 +87,6 @@ def main():
     linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    
     config.defrost()
     config.TRAIN.BASE_LR = linear_scaled_lr
     config.TRAIN.WARMUP_LR = linear_scaled_warmup_lr
@@ -100,7 +105,7 @@ def main():
 
     # print config
     logger.info(config.dump())
-    
+
     _, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
@@ -159,8 +164,23 @@ def main():
     for epoch in range(config.TRAIN.START_EPOCH, total_epochs):
         data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, logger, total_epochs)
+        train_loss, train_ttt_loss = train_one_epoch(
+            config,
+            model,
+            criterion,
+            data_loader_train,
+            optimizer,
+            epoch,
+            mixup_fn,
+            lr_scheduler,
+            logger,
+            total_epochs,
+        )
         acc1, acc5, loss = validate(config, data_loader_val, model, logger)
+
+        if dist.get_rank() == 0:
+            log_dict = {"val/acc": acc1, "val/loss": loss, "train/loss": train_loss}
+            wandb.log(log_dict, step=epoch)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
 
         if dist.get_rank() == 0 and ((epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == (total_epochs)):
@@ -199,7 +219,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
         
-        if config.AMP: 
+        if config.AMP:
             with autocast():
                 outputs = model(samples)
                 loss = criterion(outputs, targets)
